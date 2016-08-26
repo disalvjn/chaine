@@ -5,16 +5,33 @@
             [clojure.set :as set]
             [clojure.algo.generic.functor :refer [fmap]]))
 
+
+(defn pairs
+  [[x & xs :as list]]
+  (if list
+    (concat (map (partial vector x) xs)
+            (pairs xs))))
+
+(defn index
+  [kf vf coll]
+  (zipmap (mapv kf coll) (mapv vf coll)))
+
+;; fire! loop
+;; change "queue" data structure
+
 (defn has-pending-message?
   [port]
   (not-empty @(:queue port)))
 
 (defn spy [x] (pprint/pprint x) x)
+
+(def ^:dynamic *molecule-id->message-response*)
 (defn reply
-  ([p]
-   (deliver p nil))
-  ([p v]
-   (deliver p v)))
+  ([molecule]
+   (reply molecule nil))
+  ([molecule v]
+   (let [result (-> molecule :id *molecule-id->message-response*)]
+     (deliver result v))))
 
 (defn pop!
   [ref-stack]
@@ -48,8 +65,9 @@
        (let [involved (assoc @(:relatives port) (:id port) port)]
          (let [port-id->message (fmap (comp pop! :queue) involved)
                ordered-messages (mapv port-id->message order)
-               arguments (into (mapv :contents ordered-messages)
-                               (mapv :response ordered-messages))]
+               molecule-id->message-response
+               (index (comp :id :molecule) :response ordered-messages)
+               arguments (mapv :contents ordered-messages)]
            (doseq [p (vals involved)]
              (reset-states! p)
              (let [parent-molecule (:molecule p)
@@ -59,7 +77,9 @@
                (doseq [q ports-containing-msg]
                  (alter (:queue q) (partial remove #(= (:id %) (:id msg))))
                  (reset-states! q))))
-           (ref-set go! #(apply action arguments))))))
+           (ref-set go! #(binding [*molecule-id->message-response*
+                                   molecule-id->message-response]
+                           (apply action arguments)))))))
     (@go!)))
 
 (defn inject
@@ -81,33 +101,40 @@
 
 
 
-(defn message
+(defn apply-molecule
   [molecule & contents]
-  ;; get a :type so we can &, maybe?
-  {:molecule molecule
-   :contents (vec contents)
-   :id (java.util.UUID/randomUUID)
-   :response (promise)
-   :synchronous (ref false)})
+  (let [async-message {:molecule molecule
+                       :contents (vec contents)
+                       :id (java.util.UUID/randomUUID)}]
+    (case (:synchronous? molecule)
+      false async-message
 
-(defrecord Molecule [norm-pat->port msg-id->ports message->ports id]
+      true (let [sync-message (assoc async-message :response (promise))]
+             (inject sync-message)
+             @(:response sync-message)))))
+
+(defrecord Molecule
+    [norm-pat->port msg-id->ports message->ports synchronous? id]
   clojure.lang.IFn
-  ;; only for asynchronous ones... gotta do some dispatching eventually
-  (invoke [this] (message this))
-  (invoke [this a] (message this a))
-  (invoke [this a b] (message this a b))
-  (invoke [this a b c] (message this a b c))
-  (invoke [this a b c d] (message this a b c d))
-  (invoke [this a b c d e] (message this a b c d e))
-  (invoke [this a b c d e f] (message this a b c d e f))
-  (invoke [this a b c d e f g] (message this a b c d e f g))
-  (invoke [this a b c d e f g h] (message this a b c d e f g h))
-  (invoke [this a b c d e f g h i] (message this a b c d e f g h i))
-  (applyTo [this args] (apply message this args)))
+  (invoke [this] (apply-molecule this))
+  (invoke [this a] (apply-molecule this a))
+  (invoke [this a b] (apply-molecule this a b))
+  (invoke [this a b c] (apply-molecule this a b c))
+  (invoke [this a b c d] (apply-molecule this a b c d))
+  (invoke [this a b c d e] (apply-molecule this a b c d e))
+  (invoke [this a b c d e f] (apply-molecule this a b c d e f))
+  (invoke [this a b c d e f g] (apply-molecule this a b c d e f g))
+  (invoke [this a b c d e f g h] (apply-molecule this a b c d e f g h))
+  (invoke [this a b c d e f g h i] (apply-molecule this a b c d e f g h i))
+  (applyTo [this args] (apply apply-molecule this args)))
 
 (defn molecule
   []
-  (Molecule. (ref {}) (ref {}) (ref {}) (java.util.UUID/randomUUID)))
+  (Molecule. (ref {}) (ref {}) (ref {}) false (java.util.UUID/randomUUID)))
+
+(defn synchronous-molecule
+  []
+  (assoc (molecule) :synchronous? true))
 
 (defn molecules
   [n]
@@ -147,12 +174,6 @@
    (when (has-pending-message? q)
      (alter (:state p) conj (:id q)))))
 
-(defn pairs
-  [[x & xs :as list]]
-  (if list
-    (concat (map (partial vector x) xs)
-            (pairs xs))))
-
 (defn build-matcher
   [patterns]
   (let [content (gensym "content")
@@ -191,27 +212,11 @@
            (let [normalized-pattern (normalize-pattern pat)]
              (or (get @(:norm-pat->port mol)
                       normalized-pattern)
-               (add-port! mol normalized-pattern))))
+                 (add-port! mol normalized-pattern))))
          molecule-pattern-pairs)))
 
-(defn effect->action
-  [patterns effect]
-  (let [fn-args (mapv (fn [_] (gensym)) patterns)
-        msg-args (mapv (fn [_] (gensym)) patterns)
-        match-wrapped
-        (loop [[p & ps :as patterns] patterns
-               [arg & args] fn-args
-               effect `(~effect ~@msg-args)]
-          (if (empty? patterns)
-            effect
-            (recur ps args
-                   `(match ~arg
-                      ~p ~effect
-                      ~(quote [_]) (throw (Exception. "AAAAAAHHHHH"))))))]
-    `(fn ~(into fn-args msg-args) ~match-wrapped)))
-
 (defn create-reaction
-  [molecule-pattern-pairs effect action]
+  [molecule-pattern-pairs action]
   (dosync
    (let [ports (resolve-ports molecule-pattern-pairs)
          reaction-fire-ids (mapv :id ports)
@@ -223,6 +228,22 @@
               assoc reaction-fire-state {:order reaction-fire-ids
                                          :action action})))))
 
+(defn gensyms [n] (mapv (fn [_] (gensym)) (range 0 n)))
+(defn effect->action
+  [patterns effect]
+  (let [fn-args (gensyms (count patterns))
+        match-wrapped
+        (loop [[p & ps :as patterns] patterns
+               [arg & args] fn-args
+               effect effect]
+          (if (empty? patterns)
+            effect
+            (recur ps args
+                   `(match ~arg
+                      ~p ~effect
+                      ~(quote [_]) (throw (Exception. "AAAAAAHHHHH"))))))]
+    `(fn ~fn-args ~match-wrapped)))
+
 (defn untangle-cause-and-effect
   [cause effect]
   ;; cause is like [(<molecule> <pattern>*)*]
@@ -232,19 +253,34 @@
         (mapv (fn [mol pats] [mol `(quote ~(vec pats))])
               molecules patterns)
         action (effect->action patterns effect)]
+    ;; (pprint/pprint action)
     `(create-reaction
       ~molecule-pattern-pairs
-      (quote ~effect)
       ~action)))
 
-(defmacro |>
+(defmacro reactions!
   [& causes-and-effects]
   `(do ~@(map (partial apply untangle-cause-and-effect)
               (partition 2 causes-and-effects))))
 
-(defmacro reaction
-  [& body]
-  `(fn [& _#] ~@body))
+(defn make-concurrent-stack
+  []
+  (let [stack (molecule)
+        pop (synchronous-molecule)
+        push (synchronous-molecule)]
+    (reactions!
+     [(stack xs) (push x)]
+     (do
+       (inject (stack (conj xs x)))
+       (reply push))
+
+     [(stack ([x & xs] :seq)) (pop)]
+     (do
+       (inject (stack xs))
+       (reply pop x)))
+
+    (inject (stack (list)))
+    {:pop pop :push push}))
 
 (defn dining-philosophers
   [n]
@@ -255,18 +291,19 @@
             lchop (get chopsticks i)
             rchop (get chopsticks (mod (inc i) n))]
 
-        (|> [(phil name :hungry) (lchop) (rchop)]
-            (reaction
-             (println "Philosopher" name "picks up the sticks and eats.")
-             (Thread/sleep (rand 1000))
-             (println "Philosopher" name "puts down the chopsticks.")
-             (inject (lchop) (rchop) (phil name :thinking)))
+        (reactions!
+         [(phil name :hungry) (lchop) (rchop)]
+         (do
+           (println "Philosopher" name "picks up the sticks and eats.")
+           (Thread/sleep (rand 1000))
+           (println "Philosopher" name "puts down the chopsticks.")
+           (inject (lchop) (rchop) (phil name :thinking)))
 
-            [(phil name :thinking)]
-            (reaction
-             (println "Philosopher" name "is thinking.")
-             (Thread/sleep (rand 1000))
-             (inject (phil name :hungry))))))
+         [(phil name :thinking)]
+         (do
+           (println "Philosopher" name "is thinking.")
+           (Thread/sleep (rand 1000))
+           (inject (phil name :hungry))))))
 
     (let [phil-init (map (fn [phil i] (phil i :hungry))
                          philosophers (range))
